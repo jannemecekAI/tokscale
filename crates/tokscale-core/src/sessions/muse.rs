@@ -35,6 +35,12 @@ use std::path::Path;
 const USAGE_EVENT_KIND: &str = "model_completed";
 const METADATA_PAYLOAD_TYPE: &str = "runtime.session.metadata";
 
+struct ProviderMetadata {
+    record_index: usize,
+    model_id: Option<String>,
+    provider_id: String,
+}
+
 pub fn parse_muse_file(path: &Path) -> Vec<UnifiedMessage> {
     let path_session_id = session_id_from_path(path);
     let default_timestamp = file_modified_timestamp_ms(path);
@@ -44,6 +50,7 @@ pub fn parse_muse_file(path: &Path) -> Vec<UnifiedMessage> {
     // absent (e.g. `--no-session-log` runs that kept no transcript), so
     // workspace stays optional and is applied to every message afterwards.
     let mut workspace: Option<(String, String)> = None;
+    let mut provider_metadata = Vec::new();
 
     for_each_json_line(path, &mut |index, line| {
         // Cheap pre-filter only: session transcripts are multi-MB and most
@@ -60,6 +67,25 @@ pub fn parse_muse_file(path: &Path) -> Vec<UnifiedMessage> {
         if string_field(&value, "payload_type") == Some(METADATA_PAYLOAD_TYPE) {
             if workspace.is_none() {
                 workspace = workspace_from_metadata(&value);
+            }
+            if let Some(record) = value.pointer("/payload/record") {
+                // Native session/start uses the client name as a sentinel
+                // when providerId is omitted. It is not an authoritative
+                // provider and must not replace model-family inference.
+                if let Some(provider_id) = string_field(record, "provider_id").filter(|provider| {
+                    !provider.eq_ignore_ascii_case("unknown")
+                        && !provider.eq_ignore_ascii_case("muse")
+                }) {
+                    provider_metadata.push(ProviderMetadata {
+                        record_index: index,
+                        model_id: string_field(record, "model_id").map(|model| {
+                            pricing::aliases::resolve_alias(model)
+                                .unwrap_or(model)
+                                .to_string()
+                        }),
+                        provider_id: provider_id.to_string(),
+                    });
+                }
             }
             return;
         }
@@ -95,9 +121,8 @@ pub fn parse_muse_file(path: &Path) -> Vec<UnifiedMessage> {
         let model_id = pricing::aliases::resolve_alias(model_raw)
             .unwrap_or(model_raw)
             .to_string();
-        let provider_id = provider_identity::inferred_provider_from_model(&model_id)
-            .map(str::to_string)
-            .unwrap_or_else(|| "muse".to_string());
+        let provider_id =
+            provider_identity::inferred_provider_from_model(&model_id).unwrap_or("unknown");
         let tokens = tokens_from_usage(usage);
         if tokens.total() == 0 {
             return;
@@ -130,16 +155,34 @@ pub fn parse_muse_file(path: &Path) -> Vec<UnifiedMessage> {
             Some(dedup_key),
         );
         message.duration_ms = duration_ms;
-        messages.push(message);
+        messages.push((index, message));
     });
 
-    if let Some((key, label)) = workspace {
-        for message in &mut messages {
-            message.set_workspace(Some(key.clone()), Some(label.clone()));
-        }
-    }
-
     messages
+        .into_iter()
+        .map(|(index, mut message)| {
+            // Metadata can follow the first completion. Only that initial
+            // snapshot applies backwards; later snapshots affect subsequent
+            // calls, so a provider switch cannot relabel earlier usage.
+            let position = provider_metadata.partition_point(|meta| meta.record_index <= index);
+            if let Some(metadata) = provider_metadata.get(position.saturating_sub(1)) {
+                // /models can switch providers within a session. A metadata
+                // provider belongs to its paired model, not to every model
+                // the Muse client happens to run afterwards.
+                if metadata
+                    .model_id
+                    .as_deref()
+                    .is_none_or(|model| model == message.model_id)
+                {
+                    message.provider_id.clone_from(&metadata.provider_id);
+                }
+            }
+            if let Some((key, label)) = &workspace {
+                message.set_workspace(Some(key.clone()), Some(label.clone()));
+            }
+            message
+        })
+        .collect()
 }
 
 fn session_id_from_path(path: &Path) -> String {
@@ -302,7 +345,7 @@ mod tests {
         assert_eq!(message.client, "muse");
         assert_eq!(message.session_id, SESSION_ID);
         assert_eq!(message.model_id, "muse-spark-1.3-contributor");
-        assert_eq!(message.provider_id, "muse");
+        assert_eq!(message.provider_id, "meta");
         // Cache reads are a subset of input; reasoning rides inside output.
         assert_eq!(message.tokens.input, 26964 - 5105);
         assert_eq!(message.tokens.cache_read, 5105);

@@ -1510,7 +1510,8 @@ fn parser_version(client: ClientId) -> u32 {
         ClientId::Mcode => 1,
         ClientId::LmStudio => 1,
         ClientId::Hindsight => 1,
-        ClientId::Muse => 1,
+        // Preserve the actual model provider for authoritative pricing.
+        ClientId::Muse => 2,
         // Shared-family members are versioned by `SHARED_PARSER_FAMILIES`
         // through the roster lookup at the top of this function. Listing
         // them here keeps the match exhaustive at compile time; reaching
@@ -4575,6 +4576,11 @@ mod tests {
     fn test_micode_parser_version_invalidates_rows_without_cost_provenance() {
         assert_eq!(parser_version(ClientId::MiMoCode), 5);
         assert_eq!(parser_version(ClientId::MiMoDesktop), 5);
+    }
+
+    #[test]
+    fn test_muse_parser_version_invalidates_client_named_provider_rows() {
+        assert_eq!(parser_version(ClientId::Muse), 2);
     }
 
     #[test]

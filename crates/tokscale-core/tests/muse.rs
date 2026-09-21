@@ -98,7 +98,7 @@ fn test_muse_parser_reads_usage_skips_aggregates_and_attaches_workspace() {
     assert_eq!(message.client, "muse");
     assert_eq!(message.session_id, SESSION_ID);
     assert_eq!(message.model_id, "muse-spark-1.3-contributor");
-    assert_eq!(message.provider_id, "muse");
+    assert_eq!(message.provider_id, "meta");
     assert_eq!(message.tokens.input, 26964 - 5105);
     assert_eq!(message.tokens.cache_read, 5105);
     assert_eq!(message.tokens.output, 379 - 278);
