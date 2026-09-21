@@ -772,9 +772,20 @@ struct OpenCodeSchemaRow {
     eligible: bool,
 }
 
+/// Exact row identity captured by the same decode that produces a message.
+/// Kept outside UnifiedMessage because only the shared-store MiMo reducer
+/// needs fractional timestamps and embedded-id provenance across cache hits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct OpenCodeRowMetadata {
+    pub created_bits: u64,
+    pub completed_bits: Option<u64>,
+    pub has_embedded_id: bool,
+}
+
 #[derive(Default)]
 struct SchemaAccumulator {
     messages: Vec<UnifiedMessage>,
+    raw_metadata: Option<Vec<OpenCodeRowMetadata>>,
     fingerprint_indices: HashMap<OpenCodeSchemaFingerprint, Vec<usize>>,
     dedup_states: Vec<SchemaDedupState>,
     /// Dedup keys of every row that took part in a fingerprint merge, on both
@@ -814,6 +825,10 @@ impl SchemaAccumulator {
             return None;
         }
 
+        #[cfg(test)]
+        if cfg.client == super::micode::MICODE_CLIENT_ID {
+            super::micode::io_tests::record_decode();
+        }
         let mut bytes = data_json.into_bytes();
         let msg: OpenCodeSchemaMessage = match simd_json::from_slice(&mut bytes) {
             Ok(m) => m,
@@ -962,6 +977,13 @@ impl SchemaAccumulator {
 
         if cfg.dedup == DedupMode::Off {
             let index = self.messages.len();
+            if let Some(metadata) = &mut self.raw_metadata {
+                metadata.push(OpenCodeRowMetadata {
+                    created_bits: created_ms.to_bits(),
+                    completed_bits: completed_ms.map(f64::to_bits),
+                    has_embedded_id: message_id.is_some(),
+                });
+            }
             self.messages.push(unified);
             return Some(index);
         }
@@ -1229,6 +1251,44 @@ pub(crate) fn parse_opencode_schema_sqlite_with_session_clients(
     session_clients: Option<&std::collections::HashMap<String, String>>,
 ) -> Vec<UnifiedMessage> {
     scan_opencode_schema_sqlite_with_session_clients(db_path, cfg, session_clients).messages
+}
+
+/// Parse physical rows using a caller-owned connection and return exact
+/// provenance alongside each accepted message. No row is decoded twice and
+/// no fingerprint merge can discard aliases before shared-store accounting.
+pub(crate) fn parse_opencode_schema_rows_on(
+    db_path: &Path,
+    conn: &rusqlite::Connection,
+    mut cfg: OpenCodeSchemaConfig,
+    session_clients: &HashMap<String, String>,
+) -> (Vec<UnifiedMessage>, Vec<OpenCodeRowMetadata>, bool) {
+    cfg.dedup = DedupMode::Off;
+    let namespace = if cfg.namespace_rowid_dedup_key {
+        db_path.to_string_lossy().into_owned()
+    } else {
+        String::new()
+    };
+    let mut acc = SchemaAccumulator {
+        raw_metadata: Some(Vec::new()),
+        ..Default::default()
+    };
+    let mut complete = true;
+    for group in cfg.query_groups {
+        for query in *group {
+            let scan = collect_rows(db_path, conn, query, &mut |row| {
+                acc.ingest(row, &cfg, &namespace, Some(session_clients));
+            });
+            if scan.prepared() {
+                #[cfg(test)]
+                if cfg.client == super::micode::MICODE_CLIENT_ID {
+                    super::micode::io_tests::record_scan();
+                }
+                complete &= scan.completed();
+                break;
+            }
+        }
+    }
+    (acc.messages, acc.raw_metadata.unwrap_or_default(), complete)
 }
 
 // =============================================================================

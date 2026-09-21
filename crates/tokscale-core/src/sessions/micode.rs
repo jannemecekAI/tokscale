@@ -15,10 +15,11 @@
 //! reports can split the two surfaces.
 
 use super::opencode_schema::{
-    parse_opencode_schema_sqlite_with_session_clients, DedupMode, OpenCodeSchemaConfig,
+    parse_opencode_schema_rows_on, OpenCodeRowMetadata, OpenCodeSchemaConfig,
 };
 use super::utils::open_readonly_sqlite_opt;
 use super::UnifiedMessage;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -50,103 +51,106 @@ fn normalize_time(value: f64) -> f64 {
     }
 }
 
-fn read_sessions(conn: &rusqlite::Connection) -> HashMap<String, SessionMetadata> {
-    // Older stores may lack either metadata column, or the entire table.
-    for query in [
-        "SELECT id, version, time_created FROM session",
-        "SELECT id, version, NULL FROM session",
-        "SELECT id, NULL, time_created FROM session",
-    ] {
-        let Ok(mut stmt) = conn.prepare(query) else {
-            continue;
-        };
-        let Ok(rows) = stmt.query_map([], |row| {
-            let id: String = row.get(0)?;
-            let version: Option<String> = row.get(1)?;
-            let created: Option<f64> = row.get(2).ok().flatten();
-            Ok((
-                id,
-                SessionMetadata {
-                    desktop: version.as_deref().is_some_and(is_desktop_session_version),
-                    created_at: created
-                        .filter(|value| value.is_finite() && *value > 0.0)
-                        .map(normalize_time),
-                },
-            ))
-        }) else {
-            continue;
-        };
-        return rows.flatten().collect();
+fn read_sessions(conn: &rusqlite::Connection) -> (HashMap<String, SessionMetadata>, bool) {
+    let mut stmt = match conn.prepare("SELECT id, version, time_created FROM session") {
+        Ok(stmt) => stmt,
+        Err(_) => {
+            // A missing table/optional column is a compatible legacy schema,
+            // but an operational SQL failure is not evidence of absence. Only
+            // fall back after inspecting the schema successfully.
+            let columns = (|| -> rusqlite::Result<HashSet<String>> {
+                let mut stmt = conn.prepare("PRAGMA table_info(session)")?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                rows.collect()
+            })();
+            let Ok(columns) = columns else {
+                return (HashMap::new(), false);
+            };
+            if columns.is_empty() {
+                return (HashMap::new(), true);
+            }
+            if !columns.contains("id") {
+                return (HashMap::new(), false);
+            }
+            let version = if columns.contains("version") {
+                "version"
+            } else {
+                "NULL"
+            };
+            let created = if columns.contains("time_created") {
+                "time_created"
+            } else {
+                "NULL"
+            };
+            let query = format!("SELECT id, {version}, {created} FROM session");
+            let Ok(stmt) = conn.prepare(&query) else {
+                return (HashMap::new(), false);
+            };
+            stmt
+        }
+    };
+    let Ok(rows) = stmt.query_map([], |row| {
+        let id: String = row.get(0)?;
+        let version: Option<String> = row.get(1)?;
+        let created: Option<f64> = row.get(2)?;
+        Ok((
+            id,
+            SessionMetadata {
+                desktop: version.as_deref().is_some_and(is_desktop_session_version),
+                created_at: created
+                    .filter(|value| value.is_finite() && *value > 0.0)
+                    .map(normalize_time),
+            },
+        ))
+    }) else {
+        return (HashMap::new(), false);
+    };
+    let mut sessions = HashMap::new();
+    let mut complete = true;
+    for row in rows {
+        match row {
+            Ok((id, metadata)) => {
+                sessions.insert(id, metadata);
+            }
+            Err(_) => complete = false,
+        }
     }
-    HashMap::new()
+    (sessions, complete)
 }
 
-fn session_metadata(db_path: &Path) -> HashMap<String, SessionMetadata> {
-    open_readonly_sqlite_opt(db_path)
-        .map(|conn| read_sessions(&conn))
-        .unwrap_or_default()
+/// Parallel metadata for one source row, serialized only in MiMo's own cache
+/// envelope. Capturing the exact bits during the normal JSON decode avoids a
+/// second projection walk and never reconstructs precision from milliseconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct MiMoRowMetadata {
+    pub session_created_bits: Option<u64>,
+    pub row: OpenCodeRowMetadata,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct RawTiming {
-    created_bits: u64,
-    completed_bits: Option<u64>,
+impl MiMoRowMetadata {
+    pub(crate) fn is_valid(&self) -> bool {
+        f64::from_bits(self.row.created_bits).is_finite()
+            && self
+                .row
+                .completed_bits
+                .is_none_or(|bits| f64::from_bits(bits).is_finite())
+            && self.session_created_bits.is_none_or(|bits| {
+                let value = f64::from_bits(bits);
+                value.is_finite() && value > 0.0
+            })
+    }
 }
 
 #[derive(Default)]
-struct DatabaseMetadata {
-    sessions: HashMap<String, SessionMetadata>,
-    timings: HashMap<(String, String), RawTiming>,
+pub(crate) struct MiMoSource {
+    pub messages: Vec<UnifiedMessage>,
+    pub metadata: Vec<MiMoRowMetadata>,
+    pub complete: bool,
 }
 
-fn database_metadata(db_path: &Path) -> DatabaseMetadata {
-    let Some(conn) = open_readonly_sqlite_opt(db_path) else {
-        return DatabaseMetadata::default();
-    };
-    let mut metadata = DatabaseMetadata {
-        sessions: read_sessions(&conn),
-        ..Default::default()
-    };
-    // UnifiedMessage stores millisecond integers and positive durations, not
-    // the source's full floating timestamps. Project only those original
-    // fields so fingerprints retain the old schema driver's exact equality,
-    // including fractional milliseconds and absent vs nonpositive completion.
-    // This small projection is also necessary on warm source-cache hits.
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT id, session_id, json_extract(data, '$.id'),
-                json_extract(data, '$.time.created'), json_extract(data, '$.time.completed')
-         FROM message WHERE json_valid(data) ORDER BY id, session_id",
-    ) else {
-        return metadata;
-    };
-    let Ok(rows) = stmt.query_map([], |row| {
-        let row_id: String = row.get(0)?;
-        let session_id: String = row.get(1)?;
-        let embedded_id: Option<String> = row.get(2)?;
-        let created: Option<f64> = row.get(3)?;
-        let completed: Option<f64> = row.get(4)?;
-        Ok((row_id, session_id, embedded_id, created, completed))
-    }) else {
-        return metadata;
-    };
-    for (row_id, session_id, embedded_id, created, completed) in rows.flatten() {
-        let Some(created) = created.filter(|value| value.is_finite()) else {
-            continue;
-        };
-        if completed.is_some_and(|value| !value.is_finite()) {
-            continue;
-        }
-        let key = embedded_id.unwrap_or_else(|| format!("{}:{row_id}", db_path.to_string_lossy()));
-        metadata
-            .timings
-            .entry((session_id, key))
-            .or_insert(RawTiming {
-                created_bits: normalize_time(created).to_bits(),
-                completed_bits: completed.map(|value| normalize_time(value).to_bits()),
-            });
-    }
-    metadata
-}
+#[cfg(test)]
+#[path = "micode_io_tests.rs"]
+pub(crate) mod io_tests;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct UsageFingerprint {
@@ -184,7 +188,7 @@ impl UsageFingerprint {
 struct MessageOrigin {
     database: String,
     session_created_at: Option<f64>,
-    timing: Option<RawTiming>,
+    timing: Option<OpenCodeRowMetadata>,
     has_embedded_id: bool,
     workspace_conflicted: bool,
 }
@@ -235,37 +239,27 @@ pub(crate) struct MiMoMessages {
 }
 
 impl MiMoMessages {
-    pub(crate) fn extend(&mut self, path: &Path, messages: Vec<UnifiedMessage>) {
-        self.extend_with_metadata(path, messages, &database_metadata(path));
-    }
-
-    fn extend_with_metadata(
-        &mut self,
-        path: &Path,
-        messages: Vec<UnifiedMessage>,
-        metadata: &DatabaseMetadata,
-    ) {
+    pub(crate) fn extend(&mut self, path: &Path, source: MiMoSource) {
         let database = std::fs::canonicalize(path)
             .unwrap_or_else(|_| path.to_path_buf())
             .to_string_lossy()
             .into_owned();
-        for message in messages {
+        // Callers rebuild unusable cache metadata; never reopen the DB here.
+        // A malformed pair cannot silently drop the tail of the message list.
+        let valid_metadata = source.metadata.len() == source.messages.len();
+        let mut metadata = source.metadata.into_iter();
+        for message in source.messages {
+            let row = metadata
+                .next()
+                .filter(|row| valid_metadata && row.is_valid());
             let origin = MessageOrigin {
                 database: database.clone(),
-                session_created_at: metadata
-                    .sessions
-                    .get(&message.session_id)
-                    .and_then(|m| m.created_at),
-                timing: message.dedup_key.as_ref().and_then(|key| {
-                    metadata
-                        .timings
-                        .get(&(message.session_id.clone(), key.clone()))
-                        .copied()
-                }),
-                has_embedded_id: message
-                    .dedup_key
-                    .as_deref()
-                    .is_some_and(|key| !key.starts_with(&format!("{}:", path.to_string_lossy()))),
+                session_created_at: row
+                    .as_ref()
+                    .and_then(|row| row.session_created_bits)
+                    .map(f64::from_bits),
+                timing: row.as_ref().map(|row| row.row),
+                has_embedded_id: row.as_ref().is_some_and(|row| row.row.has_embedded_id),
                 workspace_conflicted: false,
             };
             self.pending.push((message, origin));
@@ -475,30 +469,56 @@ fn merge_workspace(retained: &mut UnifiedMessage, incoming: &UnifiedMessage, con
     }
 }
 
-fn parse_rows(db_path: &Path, metadata: &HashMap<String, SessionMetadata>) -> Vec<UnifiedMessage> {
-    let session_clients: HashMap<String, String> = metadata
+/// Read session attribution and physical message rows from one SQLite
+/// snapshot. The shared decoder emits exact raw timing with each accepted row,
+/// so the reducer and its cache never need to query the database again.
+pub(crate) fn parse_micode_source(db_path: &Path) -> MiMoSource {
+    #[cfg(test)]
+    io_tests::record_open();
+    let Some(conn) = open_readonly_sqlite_opt(db_path) else {
+        return MiMoSource::default();
+    };
+    if conn.execute_batch("BEGIN DEFERRED").is_err() {
+        return MiMoSource::default();
+    }
+    #[cfg(test)]
+    io_tests::record_sessions();
+    let (sessions, sessions_complete) = read_sessions(&conn);
+    let session_clients: HashMap<String, String> = sessions
         .iter()
         .filter(|(_, info)| info.desktop)
         .map(|(id, _)| (id.clone(), MICODE_DESKTOP_CLIENT_ID.to_string()))
         .collect();
-    let mut config = OpenCodeSchemaConfig::micode();
-    // MiMo needs session chronology to distinguish fork history from separate
-    // cross-surface requests. Keep that policy out of the shared OpenCode driver.
-    config.dedup = DedupMode::Off;
-    parse_opencode_schema_sqlite_with_session_clients(db_path, config, Some(&session_clients))
-}
-
-/// The persistent cache stores every physical row. Folding a file first loses
-/// absorbed message-id aliases needed to recognize copies in sibling stores.
-pub(crate) fn parse_micode_sqlite_rows(db_path: &Path) -> Vec<UnifiedMessage> {
-    parse_rows(db_path, &session_metadata(db_path))
+    let (messages, rows, complete) = parse_opencode_schema_rows_on(
+        db_path,
+        &conn,
+        OpenCodeSchemaConfig::micode(),
+        &session_clients,
+    );
+    let metadata = messages
+        .iter()
+        .zip(rows)
+        .map(|(message, row)| MiMoRowMetadata {
+            session_created_bits: sessions
+                .get(&message.session_id)
+                .and_then(|session| session.created_at)
+                .map(f64::to_bits),
+            row,
+        })
+        .collect();
+    drop(conn);
+    #[cfg(test)]
+    io_tests::run_after_read_hook();
+    MiMoSource {
+        messages,
+        metadata,
+        complete: complete && sessions_complete,
+    }
 }
 
 pub fn parse_micode_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
-    let metadata = database_metadata(db_path);
-    let parsed = parse_rows(db_path, &metadata.sessions);
     let mut messages = MiMoMessages::default();
-    messages.extend_with_metadata(db_path, parsed, &metadata);
+    messages.extend(db_path, parse_micode_source(db_path));
     messages.into_messages()
 }
 
