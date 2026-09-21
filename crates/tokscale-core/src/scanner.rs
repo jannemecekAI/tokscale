@@ -1911,6 +1911,12 @@ fn scan_all_clients_with_env_strategy_inner(
     if enabled.contains(&ClientId::DevinDesktop) {
         enabled_with_lookups.insert(ClientId::DevinCli);
     }
+    // Either MiMo surface can own rows in a store configured for its sibling.
+    // Discover both sets of roots; the parse tail still applies the requested
+    // surface filter after shared-store deduplication.
+    if enabled.contains(&ClientId::MiMoCode) || enabled.contains(&ClientId::MiMoDesktop) {
+        enabled_with_lookups.extend([ClientId::MiMoCode, ClientId::MiMoDesktop]);
+    }
     // OpenClaw can run Codex app-server against the user's own Codex home
     // (`appServer.homeScope: "user"`), and the rollouts it leaves there are
     // OpenClaw's usage (their `session_meta.originator` names OpenClaw). Treat
@@ -2170,9 +2176,9 @@ fn scan_all_clients_with_env_strategy_inner(
     // `~/Library/Application Support/orca/mimocode-hooks/shared/data/`, and that
     // copy can hold sessions the XDG copy is missing (scanning only XDG then
     // undercounts). Scan both so the totals are the union; the cross-file dedup
-    // in the parse loop (keyed on the globally unique embedded message id)
-    // collapses any message present in both locations, so overlapping data is
-    // never double-counted.
+    // in the parse loop keys embedded identities independently of surface;
+    // cross-surface fork copies with regenerated ids additionally require
+    // session-chronology evidence before collapsing.
     //
     // Xiaomi MiMo AI (desktop) shares this engine store; either client id
     // discovering the DBs is enough for the micode parse lane, which re-stamps
@@ -2856,6 +2862,20 @@ fn scan_all_clients_with_env_strategy_inner(
             }
         }
     }
+    // Generic extra-root tasks are recursive, unlike the default data-dir
+    // probes above. Route their MiMo databases into the shared SQLite lane,
+    // not an unused per-client file bucket. Apply the same filename policy to
+    // both surfaces and deduplicate aliases against the default/orca roots.
+    let mut micode_dbs = std::mem::take(&mut result.micode_dbs);
+    for client in [ClientId::MiMoCode, ClientId::MiMoDesktop] {
+        micode_dbs.extend(result.get_mut(client).drain(..).filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_micode_db_filename)
+        }));
+    }
+    result.micode_dbs = dedup_dbs_by_canonical_path(micode_dbs);
+
     for file in dedupe_cherrystudio_transcripts(cherry_files) {
         let key = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
         if seen.insert((ClientId::CherryStudio, key)) {

@@ -1190,9 +1190,10 @@ const SHARED_PARSER_FAMILIES: &[SharedParserFamily] = &[
             // warm v3 entries still label every row `micode`.
             // Desktop and CLI parse through the same `parse_micode_sqlite`
             // entrypoint and therefore share MiMo Code's invalidation history.
-            // +1 for surface-aware fingerprint merge / session classification.
-            (ClientId::MiMoCode, 4),
-            (ClientId::MiMoDesktop, 4),
+            // v5->v6: deduplicate forked history across desktop/CLI surfaces
+            // while retaining the original call's surface attribution.
+            (ClientId::MiMoCode, 5),
+            (ClientId::MiMoDesktop, 5),
             (ClientId::Kilo, 0),
         ],
     },
@@ -4574,8 +4575,8 @@ mod tests {
 
     #[test]
     fn test_micode_parser_version_invalidates_rows_without_cost_provenance() {
-        assert_eq!(parser_version(ClientId::MiMoCode), 5);
-        assert_eq!(parser_version(ClientId::MiMoDesktop), 5);
+        assert_eq!(parser_version(ClientId::MiMoCode), 6);
+        assert_eq!(parser_version(ClientId::MiMoDesktop), 6);
     }
 
     #[test]
@@ -4639,8 +4640,8 @@ mod tests {
                 "opencode schema",
                 &[
                     (ClientId::OpenCode, 2),
-                    (ClientId::MiMoCode, 4),
-                    (ClientId::MiMoDesktop, 4),
+                    (ClientId::MiMoCode, 5),
+                    (ClientId::MiMoDesktop, 5),
                     (ClientId::Kilo, 0),
                 ],
             ),

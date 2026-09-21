@@ -15,11 +15,11 @@
 //! reports can split the two surfaces.
 
 use super::opencode_schema::{
-    parse_opencode_schema_sqlite, parse_opencode_schema_sqlite_with_session_clients,
-    OpenCodeSchemaConfig,
+    parse_opencode_schema_sqlite_with_session_clients, DedupMode, OpenCodeSchemaConfig,
 };
+use super::utils::open_readonly_sqlite_opt;
 use super::UnifiedMessage;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// Client id for mimo code CLI / headless engine sessions.
@@ -29,8 +29,6 @@ pub const MICODE_DESKTOP_CLIENT_ID: &str = "micode-desktop";
 /// `session.version` prefix written by the Xiaomi MiMo AI desktop install.
 pub const MICODE_DESKTOP_VERSION_PREFIX: &str = "desktop-";
 
-/// True when a `session.version` value identifies a Xiaomi MiMo AI desktop
-/// session rather than a CLI/engine install.
 pub fn is_desktop_session_version(version: &str) -> bool {
     version
         .trim()
@@ -38,42 +36,470 @@ pub fn is_desktop_session_version(version: &str) -> bool {
         .starts_with(MICODE_DESKTOP_VERSION_PREFIX)
 }
 
-fn desktop_session_ids(db_path: &Path) -> Option<HashSet<String>> {
-    let conn = rusqlite::Connection::open(db_path).ok()?;
-    let mut stmt = conn.prepare("SELECT id, version FROM session").ok()?;
-    let rows = stmt
-        .query_map([], |row| {
+#[derive(Clone, Default)]
+struct SessionMetadata {
+    desktop: bool,
+    created_at: Option<f64>,
+}
+
+fn normalize_time(value: f64) -> f64 {
+    if value > 1e12 {
+        value
+    } else {
+        value * 1000.0
+    }
+}
+
+fn read_sessions(conn: &rusqlite::Connection) -> HashMap<String, SessionMetadata> {
+    // Older stores may lack either metadata column, or the entire table.
+    for query in [
+        "SELECT id, version, time_created FROM session",
+        "SELECT id, version, NULL FROM session",
+        "SELECT id, NULL, time_created FROM session",
+    ] {
+        let Ok(mut stmt) = conn.prepare(query) else {
+            continue;
+        };
+        let Ok(rows) = stmt.query_map([], |row| {
             let id: String = row.get(0)?;
             let version: Option<String> = row.get(1)?;
-            Ok((id, version))
+            let created: Option<f64> = row.get(2).ok().flatten();
+            Ok((
+                id,
+                SessionMetadata {
+                    desktop: version.as_deref().is_some_and(is_desktop_session_version),
+                    created_at: created
+                        .filter(|value| value.is_finite() && *value > 0.0)
+                        .map(normalize_time),
+                },
+            ))
+        }) else {
+            continue;
+        };
+        return rows.flatten().collect();
+    }
+    HashMap::new()
+}
+
+fn session_metadata(db_path: &Path) -> HashMap<String, SessionMetadata> {
+    open_readonly_sqlite_opt(db_path)
+        .map(|conn| read_sessions(&conn))
+        .unwrap_or_default()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RawTiming {
+    created_bits: u64,
+    completed_bits: Option<u64>,
+}
+
+#[derive(Default)]
+struct DatabaseMetadata {
+    sessions: HashMap<String, SessionMetadata>,
+    timings: HashMap<(String, String), RawTiming>,
+}
+
+fn database_metadata(db_path: &Path) -> DatabaseMetadata {
+    let Some(conn) = open_readonly_sqlite_opt(db_path) else {
+        return DatabaseMetadata::default();
+    };
+    let mut metadata = DatabaseMetadata {
+        sessions: read_sessions(&conn),
+        ..Default::default()
+    };
+    // UnifiedMessage stores millisecond integers and positive durations, not
+    // the source's full floating timestamps. Project only those original
+    // fields so fingerprints retain the old schema driver's exact equality,
+    // including fractional milliseconds and absent vs nonpositive completion.
+    // This small projection is also necessary on warm source-cache hits.
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT id, session_id, json_extract(data, '$.id'),
+                json_extract(data, '$.time.created'), json_extract(data, '$.time.completed')
+         FROM message WHERE json_valid(data) ORDER BY id, session_id",
+    ) else {
+        return metadata;
+    };
+    let Ok(rows) = stmt.query_map([], |row| {
+        let row_id: String = row.get(0)?;
+        let session_id: String = row.get(1)?;
+        let embedded_id: Option<String> = row.get(2)?;
+        let created: Option<f64> = row.get(3)?;
+        let completed: Option<f64> = row.get(4)?;
+        Ok((row_id, session_id, embedded_id, created, completed))
+    }) else {
+        return metadata;
+    };
+    for (row_id, session_id, embedded_id, created, completed) in rows.flatten() {
+        let Some(created) = created.filter(|value| value.is_finite()) else {
+            continue;
+        };
+        if completed.is_some_and(|value| !value.is_finite()) {
+            continue;
+        }
+        let key = embedded_id.unwrap_or_else(|| format!("{}:{row_id}", db_path.to_string_lossy()));
+        metadata
+            .timings
+            .entry((session_id, key))
+            .or_insert(RawTiming {
+                created_bits: normalize_time(created).to_bits(),
+                completed_bits: completed.map(|value| normalize_time(value).to_bits()),
+            });
+    }
+    metadata
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct UsageFingerprint {
+    created_bits: u64,
+    completed_bits: Option<u64>,
+    model: String,
+    provider: String,
+    tokens: [i64; 5],
+    cost: u64,
+    agent: Option<String>,
+}
+
+impl UsageFingerprint {
+    fn new(message: &UnifiedMessage, origin: &MessageOrigin) -> Option<Self> {
+        let timing = origin.timing?;
+        Some(Self {
+            created_bits: timing.created_bits,
+            completed_bits: timing.completed_bits,
+            model: message.model_id.clone(),
+            provider: message.provider_id.clone(),
+            tokens: [
+                message.tokens.input,
+                message.tokens.output,
+                message.tokens.cache_read,
+                message.tokens.cache_write,
+                message.tokens.reasoning,
+            ],
+            cost: message.cost.to_bits(),
+            agent: message.agent.clone(),
         })
-        .ok()?;
-    let mut desktop = HashSet::new();
-    for (id, version) in rows.flatten() {
-        if version.as_deref().is_some_and(is_desktop_session_version) {
-            desktop.insert(id);
+    }
+}
+
+#[derive(Clone)]
+struct MessageOrigin {
+    database: String,
+    session_created_at: Option<f64>,
+    timing: Option<RawTiming>,
+    has_embedded_id: bool,
+    workspace_conflicted: bool,
+}
+
+impl MessageOrigin {
+    fn owns_turn(&self) -> Option<bool> {
+        Some(f64::from_bits(self.timing?.created_bits) >= self.session_created_at?)
+    }
+
+    fn preference<'a>(
+        &'a self,
+        message: &'a UnifiedMessage,
+    ) -> (u8, u64, &'a str, &'a str, &'a str) {
+        let rank = match self.owns_turn() {
+            Some(true) => 0,
+            None => 1,
+            Some(false) => 2,
+        };
+        (
+            rank,
+            self.session_created_at
+                .map(f64::to_bits)
+                .unwrap_or(u64::MAX),
+            &message.session_id,
+            &message.client,
+            &self.database,
+        )
+    }
+}
+
+/// One accounting identity for the shared store, used by both public parse
+/// lanes. A surface is presentation metadata, never a second charge for an
+/// embedded message id. Different ids require evidence before cross-surface
+/// fingerprint merging: MiMo forks rewrite ids but preserve timestamps, so a
+/// historical copy predates its new session while its original does not.
+type SourceObservation = (String, String, Option<bool>);
+type FingerprintObservations = HashMap<UsageFingerprint, HashSet<SourceObservation>>;
+
+#[derive(Default)]
+pub(crate) struct MiMoMessages {
+    pending: Vec<(UnifiedMessage, MessageOrigin)>,
+    messages: Vec<UnifiedMessage>,
+    origins: Vec<MessageOrigin>,
+    source_surfaces: Vec<FingerprintObservations>,
+    redirects: Vec<usize>,
+    keys: HashMap<String, usize>,
+    fingerprints: HashMap<UsageFingerprint, Vec<usize>>,
+}
+
+impl MiMoMessages {
+    pub(crate) fn extend(&mut self, path: &Path, messages: Vec<UnifiedMessage>) {
+        self.extend_with_metadata(path, messages, &database_metadata(path));
+    }
+
+    fn extend_with_metadata(
+        &mut self,
+        path: &Path,
+        messages: Vec<UnifiedMessage>,
+        metadata: &DatabaseMetadata,
+    ) {
+        let database = std::fs::canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .into_owned();
+        for message in messages {
+            let origin = MessageOrigin {
+                database: database.clone(),
+                session_created_at: metadata
+                    .sessions
+                    .get(&message.session_id)
+                    .and_then(|m| m.created_at),
+                timing: message.dedup_key.as_ref().and_then(|key| {
+                    metadata
+                        .timings
+                        .get(&(message.session_id.clone(), key.clone()))
+                        .copied()
+                }),
+                has_embedded_id: message
+                    .dedup_key
+                    .as_deref()
+                    .is_some_and(|key| !key.starts_with(&format!("{}:", path.to_string_lossy()))),
+                workspace_conflicted: false,
+            };
+            self.pending.push((message, origin));
         }
     }
-    Some(desktop)
+
+    fn canonical_index(&self, mut index: usize) -> usize {
+        while self.redirects[index] != index {
+            index = self.redirects[index];
+        }
+        index
+    }
+
+    fn insert(&mut self, message: UnifiedMessage, origin: MessageOrigin) {
+        let fingerprint = UsageFingerprint::new(&message, &origin);
+        let by_key = message
+            .dedup_key
+            .as_ref()
+            .and_then(|key| self.keys.get(key))
+            .map(|&index| self.canonical_index(index));
+        let by_fingerprint = fingerprint.as_ref().and_then(|fingerprint| {
+            self.fingerprints.get(fingerprint).and_then(|indices| {
+                indices
+                    .iter()
+                    .map(|&index| self.canonical_index(index))
+                    .find(|&index| {
+                        // Every edge must be witnessed by an immutable source
+                        // observation, never a canonical row whose cost/origin
+                        // came from different databases during reduction.
+                        self.source_surfaces[index]
+                            .get(fingerprint)
+                            .is_some_and(|sources| {
+                                sources.iter().any(|(database, client, owns_turn)| {
+                                    (database == &origin.database && client == &message.client)
+                                        || (client != &message.client
+                                            && matches!(
+                                                (origin.owns_turn(), *owns_turn),
+                                                (Some(true), Some(false))
+                                                    | (Some(false), Some(true))
+                                            ))
+                                })
+                            })
+                    })
+            })
+        });
+        let candidate = match (by_key, by_fingerprint) {
+            (Some(key), Some(fingerprint)) if key != fingerprint => {
+                // An id-only copy without chronology can arrive before the
+                // row proving that id belongs to another slot's fork history.
+                // Join both identities rather than allowing the early key hit
+                // to hide later ownership evidence. Redirects preserve aliases.
+                let (keep, discard) = if self.origins[key].preference(&self.messages[key])
+                    <= self.origins[fingerprint].preference(&self.messages[fingerprint])
+                {
+                    (key, fingerprint)
+                } else {
+                    (fingerprint, key)
+                };
+                let original_workspace = (origin.owns_turn() == Some(false)
+                    && self.origins[keep].owns_turn() == Some(true))
+                .then(|| {
+                    (
+                        self.messages[keep].workspace_key.clone(),
+                        self.messages[keep].workspace_label.clone(),
+                        self.origins[keep].workspace_conflicted,
+                    )
+                });
+                // Joining canonical slots transfers their actual observations
+                // below; the merged representative is not another source row.
+                self.merge(
+                    keep,
+                    self.messages[discard].clone(),
+                    self.origins[discard].clone(),
+                );
+                // The incoming row connects the metadata-less alias to proven
+                // copied history. Its temporary unknown status is not evidence
+                // that the original owner's workspace conflicts.
+                if let Some((key, label, conflicted)) = original_workspace {
+                    self.messages[keep].set_workspace(key, label);
+                    self.origins[keep].workspace_conflicted = conflicted;
+                }
+                let sources = std::mem::take(&mut self.source_surfaces[discard]);
+                for (fingerprint, sources) in sources {
+                    self.source_surfaces[keep]
+                        .entry(fingerprint)
+                        .or_default()
+                        .extend(sources);
+                }
+                self.redirects[discard] = keep;
+                Some(keep)
+            }
+            (key, fingerprint) => key.or(fingerprint),
+        };
+        if let Some(index) = candidate {
+            if let Some(key) = &message.dedup_key {
+                self.keys.insert(key.clone(), index);
+            }
+            self.merge_observation(index, message, origin);
+        } else {
+            let index = self.messages.len();
+            if let Some(key) = &message.dedup_key {
+                self.keys.insert(key.clone(), index);
+            }
+            let mut sources = HashMap::new();
+            if let Some(fingerprint) = fingerprint {
+                sources.insert(
+                    fingerprint.clone(),
+                    HashSet::from([(
+                        origin.database.clone(),
+                        message.client.clone(),
+                        origin.owns_turn(),
+                    )]),
+                );
+                self.fingerprints
+                    .entry(fingerprint)
+                    .or_default()
+                    .push(index);
+            }
+            self.source_surfaces.push(sources);
+            self.messages.push(message);
+            self.origins.push(origin);
+            self.redirects.push(index);
+        }
+    }
+
+    fn merge_observation(&mut self, index: usize, incoming: UnifiedMessage, origin: MessageOrigin) {
+        if let Some(observed) = UsageFingerprint::new(&incoming, &origin) {
+            self.source_surfaces[index]
+                .entry(observed.clone())
+                .or_default()
+                .insert((
+                    origin.database.clone(),
+                    incoming.client.clone(),
+                    origin.owns_turn(),
+                ));
+            let indices = self.fingerprints.entry(observed).or_default();
+            if !indices.contains(&index) {
+                indices.push(index);
+            }
+        }
+        // Authoritative cost promotion cannot mutate the identity graph: only
+        // the raw observation indexed above can establish another match.
+        self.merge(index, incoming, origin);
+    }
+
+    fn merge(&mut self, index: usize, incoming: UnifiedMessage, incoming_origin: MessageOrigin) {
+        let retained = &mut self.messages[index];
+        let retained_origin = &mut self.origins[index];
+        // into_messages sorted original owners first, so no later copy can
+        // change the chosen client/session or replace an original workspace.
+        let identified_original = matches!(
+            (retained_origin.owns_turn(), incoming_origin.owns_turn()),
+            (Some(true), Some(false))
+        );
+        if !retained.has_authoritative_cost() && incoming.has_authoritative_cost() {
+            retained.cost = incoming.cost;
+            retained.mark_provider_reported_cost();
+        }
+        // The shared schema namespaces a missing embedded id by DB path. If a
+        // fingerprint-equivalent copy supplies one, preserve that globally
+        // useful identity just as the previous schema accumulator did.
+        if !retained_origin.has_embedded_id && incoming_origin.has_embedded_id {
+            retained.dedup_key = incoming.dedup_key.clone();
+            retained_origin.has_embedded_id = true;
+        }
+        if !identified_original {
+            retained_origin.workspace_conflicted |= retained.workspace_key.is_some()
+                && incoming.workspace_key.is_some()
+                && retained.workspace_key != incoming.workspace_key;
+            merge_workspace(retained, &incoming, retained_origin.workspace_conflicted);
+        }
+    }
+
+    pub(crate) fn into_messages(mut self) -> Vec<UnifiedMessage> {
+        let mut pending = std::mem::take(&mut self.pending);
+        // Establish original owners before matching their historical copies.
+        // This also handles several copies arriving before the only original.
+        pending.sort_by(|(a, a_origin), (b, b_origin)| {
+            a_origin
+                .preference(a)
+                .cmp(&b_origin.preference(b))
+                .then_with(|| a.dedup_key.cmp(&b.dedup_key))
+        });
+        for (message, origin) in pending {
+            self.insert(message, origin);
+        }
+        self.messages
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, message)| (self.redirects[index] == index).then_some(message))
+            .collect()
+    }
+}
+
+fn merge_workspace(retained: &mut UnifiedMessage, incoming: &UnifiedMessage, conflicted: bool) {
+    if conflicted
+        || (retained.workspace_key.is_some()
+            && incoming.workspace_key.is_some()
+            && retained.workspace_key != incoming.workspace_key)
+    {
+        retained.set_workspace(None, None);
+    } else if retained.workspace_key.is_none() {
+        retained.set_workspace(
+            incoming.workspace_key.clone(),
+            incoming.workspace_label.clone(),
+        );
+    }
+}
+
+fn parse_rows(db_path: &Path, metadata: &HashMap<String, SessionMetadata>) -> Vec<UnifiedMessage> {
+    let session_clients: HashMap<String, String> = metadata
+        .iter()
+        .filter(|(_, info)| info.desktop)
+        .map(|(id, _)| (id.clone(), MICODE_DESKTOP_CLIENT_ID.to_string()))
+        .collect();
+    let mut config = OpenCodeSchemaConfig::micode();
+    // MiMo needs session chronology to distinguish fork history from separate
+    // cross-surface requests. Keep that policy out of the shared OpenCode driver.
+    config.dedup = DedupMode::Off;
+    parse_opencode_schema_sqlite_with_session_clients(db_path, config, Some(&session_clients))
+}
+
+/// The persistent cache stores every physical row. Folding a file first loses
+/// absorbed message-id aliases needed to recognize copies in sibling stores.
+pub(crate) fn parse_micode_sqlite_rows(db_path: &Path) -> Vec<UnifiedMessage> {
+    parse_rows(db_path, &session_metadata(db_path))
 }
 
 pub fn parse_micode_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
-    let desktop_ids = desktop_session_ids(db_path).unwrap_or_default();
-    if desktop_ids.is_empty() {
-        return parse_opencode_schema_sqlite(db_path, OpenCodeSchemaConfig::micode());
-    }
-    // Classify surfaces before the shared fingerprint merge: identical usage
-    // stats on a desktop turn and a CLI turn must not collapse into one row
-    // labeled by whichever session was read first.
-    let session_clients: std::collections::HashMap<String, String> = desktop_ids
-        .into_iter()
-        .map(|id| (id, MICODE_DESKTOP_CLIENT_ID.to_string()))
-        .collect();
-    parse_opencode_schema_sqlite_with_session_clients(
-        db_path,
-        OpenCodeSchemaConfig::micode(),
-        Some(&session_clients),
-    )
+    let metadata = database_metadata(db_path);
+    let parsed = parse_rows(db_path, &metadata.sessions);
+    let mut messages = MiMoMessages::default();
+    messages.extend_with_metadata(db_path, parsed, &metadata);
+    messages.into_messages()
 }
 
 #[cfg(test)]
