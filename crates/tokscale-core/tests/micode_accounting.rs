@@ -10,30 +10,8 @@ use tokscale_core::{
 
 const TURN: i64 = 1_780_000_000_000;
 
-struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
-impl EnvGuard {
-    fn set(values: &[(&'static str, &std::ffi::OsStr)]) -> Self {
-        let old = values
-            .iter()
-            .map(|(key, value)| {
-                let old = std::env::var_os(key);
-                std::env::set_var(key, value);
-                (*key, old)
-            })
-            .collect();
-        Self(old)
-    }
-}
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (key, old) in &self.0 {
-            match old {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
-    }
-}
+mod common;
+use common::EnvGuard;
 
 fn database(path: &Path, chronology: bool) -> Connection {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();

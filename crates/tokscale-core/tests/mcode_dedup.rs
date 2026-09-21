@@ -3,22 +3,9 @@ use tokscale_core::{
     parse_local_clients, parse_local_unified_messages_with_pricing, ClientId, LocalParseOptions,
 };
 
-struct ConfigGuard(Option<std::ffi::OsString>);
-impl ConfigGuard {
-    fn new(path: &Path) -> Self {
-        let old = std::env::var_os("TOKSCALE_CONFIG_DIR");
-        std::env::set_var("TOKSCALE_CONFIG_DIR", path);
-        Self(old)
-    }
-}
-impl Drop for ConfigGuard {
-    fn drop(&mut self) {
-        match &self.0 {
-            Some(value) => std::env::set_var("TOKSCALE_CONFIG_DIR", value),
-            None => std::env::remove_var("TOKSCALE_CONFIG_DIR"),
-        }
-    }
-}
+mod common;
+use common::EnvGuard;
+
 fn options(home: &Path) -> LocalParseOptions {
     LocalParseOptions {
         home_dir: Some(home.to_string_lossy().into_owned()),
@@ -47,7 +34,7 @@ fn capture(envelope: bool, turn: &str) -> String {
 #[serial_test::serial]
 async fn copied_mcode_captures_are_one_turn_in_both_lanes_cold_and_warm() {
     let cache = tempfile::tempdir().unwrap();
-    let _env = ConfigGuard::new(cache.path());
+    let _env = EnvGuard::set(&[("TOKSCALE_CONFIG_DIR", cache.path().as_os_str())]);
     for envelope in [false, true] {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join(".config/tokscale/headless/mcode");
