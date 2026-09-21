@@ -159,7 +159,7 @@ function copyModels(
   return result;
 }
 
-function modelsForHighWater(
+export function modelsForHighWater(
   breakdown?: ClientBreakdownData
 ): Record<string, ModelBreakdownData> {
   const models = copyModels(breakdown?.models);

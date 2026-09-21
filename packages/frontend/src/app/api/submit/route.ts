@@ -42,6 +42,7 @@ import {
   type DeviceParserStates,
   type ParserHighWaterPlan,
 } from "@/lib/db/parserHighWater";
+import { MICODE_FAMILY, planMiCodeTransition } from "@/lib/db/micodeTransition";
 import { SOURCE_DISPLAY_NAMES } from "@/lib/constants";
 import { normalizeUsernameCacheKey, revalidateUsernamePaths } from "@/lib/db/usernameLookup";
 import { getLeaderboardData } from "@/lib/leaderboard/getLeaderboard";
@@ -865,6 +866,26 @@ export async function POST(request: Request) {
           );
         }
       }
+      // Admission is atomic across the shared-store family. Independent
+      // per-client guards would preserve old combined `micode` spend and add
+      // its newly labelled desktop copy on top.
+      const micodePlan = planMiCodeTransition({
+        submittedClients,
+        incomingVersions: data.scanScope?.parserVersions,
+        persistedVersions: submittedDevice.parserVersions ?? undefined,
+        fullHistory: data.scanScope?.fullHistory === true,
+        isBackfill,
+        contributions: data.contributions,
+        existingDays: existingDeviceDays,
+      });
+      if (micodePlan.mode !== "status-quo") {
+        for (const client of MICODE_FAMILY) {
+          parserPlans.set(client, micodePlan.mode === "replace"
+            ? { mode: "replace", increments: {}, layoutDays: micodePlan.layouts![client] }
+            : { mode: "freeze", increments: {} });
+        }
+        if (micodePlan.warning) warnings.push(micodePlan.warning);
+      }
       const plannedIncrementClients = [...parserPlans].filter(
         ([, plan]) =>
           plan.mode === "incremental" || plan.mode === "baseline-legacy"
@@ -1134,12 +1155,13 @@ export async function POST(request: Request) {
       const advancedParserStates = [...parserPlans].flatMap(([client, plan]) =>
         plan.nextState ? [[client, plan.nextState] as const] : []
       );
-      if (advancedParserStates.length > 0) {
+      if (advancedParserStates.length > 0 || micodePlan.parserVersions) {
         await tx
           .update(submittedDevices)
           .set({
             parserVersions: {
               ...(submittedDevice.parserVersions ?? {}),
+              ...micodePlan.parserVersions,
               ...Object.fromEntries(
                 advancedParserStates.map(([client, state]) => [
                   client,
@@ -1287,6 +1309,13 @@ export async function POST(request: Request) {
         .from(dailyBreakdown)
         .where(eq(dailyBreakdown.submissionId, submissionId));
 
+      // A first submission can intentionally freeze every incoming client.
+      // With no credited days, both MIN fallbacks are NULL; keep the validated
+      // request range so the NOT NULL submission columns do not turn the
+      // actionable freeze response (and its sticky generation marker) into 500.
+      const effectiveDateStart = aggregates.dateStart ?? data.meta.dateRange.start;
+      const effectiveDateEnd = aggregates.dateEnd ?? data.meta.dateRange.end;
+
       // Session-shape totals come from the PER-DEVICE high-water marks, not
       // from SUM(daily_breakdown.active_time_ms).
       //
@@ -1365,8 +1394,8 @@ export async function POST(request: Request) {
           cacheReadTokens: totalCacheRead,
           cacheCreationTokens: totalCacheCreation,
           reasoningTokens: totalReasoning,
-          dateStart: aggregates.dateStart,
-          dateEnd: aggregates.dateEnd,
+          dateStart: effectiveDateStart,
+          dateEnd: effectiveDateEnd,
            sourcesUsed: Array.from(allClients),
            modelsUsed: Array.from(allModels),
           cliVersion: data.meta.version,
@@ -1437,8 +1466,8 @@ export async function POST(request: Request) {
           totalTokens: aggregates.totalTokens,
           totalCost: parseFloat(aggregates.totalCost),
           dateRange: {
-            start: aggregates.dateStart,
-            end: aggregates.dateEnd,
+            start: effectiveDateStart,
+            end: effectiveDateEnd,
           },
           activeDays: aggregates.activeDays,
           clients: Array.from(allClients),
