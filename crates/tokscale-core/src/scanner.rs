@@ -670,6 +670,13 @@ pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
                 // naturally rejects the `.db-wal`/`.db-shm`/`.db-journal`
                 // sidecars SQLite writes alongside the main file.
                 "*.db" => file_name.ends_with(".db"),
+                // A user-selected MiMo file may be a renamed shared store.
+                // Directory roots still discover only known engine filenames,
+                // never every unrelated SQLite database below that directory.
+                "micode-db" => {
+                    (e.depth() == 0 && path.extension().is_some_and(|ext| ext == "db"))
+                        || is_micode_db_filename(file_name)
+                }
                 _ => false,
             }
         })
@@ -1539,7 +1546,18 @@ fn push_unique_scan_task(
     client_id: ClientId,
     raw_path: impl Into<PathBuf>,
 ) {
-    push_unique_scan_task_with_pattern(tasks, seen, client_id, raw_path, client_id.data().pattern);
+    let raw_path = raw_path.into();
+    let pattern = if matches!(client_id, ClientId::MiMoCode | ClientId::MiMoDesktop) {
+        // Reject invalid explicit aliases before canonical-root dedup, or an
+        // alias.txt listed first could suppress a valid alias.db of the store.
+        if raw_path.is_file() && !raw_path.extension().is_some_and(|ext| ext == "db") {
+            return;
+        }
+        "micode-db"
+    } else {
+        client_id.data().pattern
+    };
+    push_unique_scan_task_with_pattern(tasks, seen, client_id, raw_path, pattern);
 }
 
 fn push_unique_scan_task_with_pattern(
@@ -2862,17 +2880,13 @@ fn scan_all_clients_with_env_strategy_inner(
             }
         }
     }
-    // Generic extra-root tasks are recursive, unlike the default data-dir
-    // probes above. Route their MiMo databases into the shared SQLite lane,
-    // not an unused per-client file bucket. Apply the same filename policy to
-    // both surfaces and deduplicate aliases against the default/orca roots.
+    // Extra-root tasks distinguish explicitly selected files from recursively
+    // discovered engine filenames before this merge. Route both surfaces into
+    // the shared SQLite lane and deduplicate aliases against default/orca roots;
+    // filtering names again here would discard an explicitly renamed store.
     let mut micode_dbs = std::mem::take(&mut result.micode_dbs);
     for client in [ClientId::MiMoCode, ClientId::MiMoDesktop] {
-        micode_dbs.extend(result.get_mut(client).drain(..).filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(is_micode_db_filename)
-        }));
+        micode_dbs.append(result.get_mut(client));
     }
     result.micode_dbs = dedup_dbs_by_canonical_path(micode_dbs);
 
