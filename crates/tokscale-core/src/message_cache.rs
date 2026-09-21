@@ -1511,8 +1511,9 @@ fn parser_version(client: ClientId) -> u32 {
         ClientId::Mcode => 1,
         ClientId::LmStudio => 1,
         ClientId::Hindsight => 1,
-        // Preserve the actual model provider for authoritative pricing.
-        ClientId::Muse => 2,
+        // v2 preserves actual provider identity; v3 clears stale provider
+        // metadata when a persisted reset/sentinel snapshot removes it.
+        ClientId::Muse => 3,
         // Shared-family members are versioned by `SHARED_PARSER_FAMILIES`
         // through the roster lookup at the top of this function. Listing
         // them here keeps the match exhaustive at compile time; reaching
@@ -4580,8 +4581,8 @@ mod tests {
     }
 
     #[test]
-    fn test_muse_parser_version_invalidates_client_named_provider_rows() {
-        assert_eq!(parser_version(ClientId::Muse), 2);
+    fn test_muse_parser_version_invalidates_stale_provider_metadata_after_reset() {
+        assert_eq!(parser_version(ClientId::Muse), 3);
     }
 
     #[test]

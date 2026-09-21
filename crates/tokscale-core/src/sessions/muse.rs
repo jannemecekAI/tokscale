@@ -38,7 +38,7 @@ const METADATA_PAYLOAD_TYPE: &str = "runtime.session.metadata";
 struct ProviderMetadata {
     record_index: usize,
     model_id: Option<String>,
-    provider_id: String,
+    provider_id: Option<String>,
 }
 
 pub fn parse_muse_file(path: &Path) -> Vec<UnifiedMessage> {
@@ -72,20 +72,25 @@ pub fn parse_muse_file(path: &Path) -> Vec<UnifiedMessage> {
                 // Native session/start uses the client name as a sentinel
                 // when providerId is omitted. It is not an authoritative
                 // provider and must not replace model-family inference.
-                if let Some(provider_id) = string_field(record, "provider_id").filter(|provider| {
-                    !provider.eq_ignore_ascii_case("unknown")
-                        && !provider.eq_ignore_ascii_case("muse")
-                }) {
-                    provider_metadata.push(ProviderMetadata {
-                        record_index: index,
-                        model_id: string_field(record, "model_id").map(|model| {
-                            pricing::aliases::resolve_alias(model)
-                                .unwrap_or(model)
-                                .to_string()
-                        }),
-                        provider_id: provider_id.to_string(),
-                    });
-                }
+                let provider_id = string_field(record, "provider_id")
+                    .filter(|provider| {
+                        !provider.eq_ignore_ascii_case("unknown")
+                            && !provider.eq_ignore_ascii_case("muse")
+                    })
+                    .map(str::to_string);
+                // Keep every snapshot in the timeline: a missing or
+                // nonauthoritative provider clears an earlier override.
+                // Dropping it would also let a later explicit snapshot
+                // backfill across the initial metadata boundary.
+                provider_metadata.push(ProviderMetadata {
+                    record_index: index,
+                    model_id: string_field(record, "model_id").map(|model| {
+                        pricing::aliases::resolve_alias(model)
+                            .unwrap_or(model)
+                            .to_string()
+                    }),
+                    provider_id,
+                });
             }
             return;
         }
@@ -174,7 +179,9 @@ pub fn parse_muse_file(path: &Path) -> Vec<UnifiedMessage> {
                     .as_deref()
                     .is_none_or(|model| model == message.model_id)
                 {
-                    message.provider_id.clone_from(&metadata.provider_id);
+                    if let Some(provider_id) = &metadata.provider_id {
+                        message.provider_id.clone_from(provider_id);
+                    }
                 }
             }
             if let Some((key, label)) = &workspace {

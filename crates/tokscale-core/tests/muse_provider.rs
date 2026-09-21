@@ -185,6 +185,118 @@ fn metadata_provider_does_not_leak_across_model_or_provider_switches() {
     assert_eq!(providers, ["meta", "openai", "aihubmix", "meta"]);
 }
 
+fn provider_reset_metadata(provider: Option<serde_json::Value>, model: Option<&str>) -> String {
+    let mut record = json!({"model_id": model});
+    if let Some(provider) = provider {
+        record["provider_id"] = provider;
+    }
+    json!({
+        "payload_type": "runtime.session.metadata",
+        "payload": {"record": record}
+    })
+    .to_string()
+}
+
+fn nonauthoritative_provider_values() -> Vec<Option<serde_json::Value>> {
+    vec![
+        Some(json!("muse")),
+        Some(json!(" MuSe ")),
+        Some(json!("unknown")),
+        Some(json!(" UNKNOWN ")),
+        Some(json!("")),
+        Some(json!("  ")),
+        None,
+        Some(serde_json::Value::Null),
+    ]
+}
+
+#[test]
+fn nonauthoritative_metadata_resets_previous_provider_until_next_explicit_snapshot() {
+    for (model, inferred_provider) in [
+        ("muse-spark-1.2", "meta"),
+        ("local-custom-model", "unknown"),
+    ] {
+        for reset_provider in nonauthoritative_provider_values() {
+            for reset_model in [Some(model), None] {
+                let reset = provider_reset_metadata(reset_provider.clone(), reset_model);
+                let messages = parse(&[
+                    metadata("aihubmix", Some(model)),
+                    completion(39, model),
+                    reset.clone(),
+                    completion(40, model),
+                    metadata("private-gateway", Some(model)),
+                    completion(41, model),
+                ]);
+                let providers: Vec<&str> = messages
+                    .iter()
+                    .map(|message| message.provider_id.as_str())
+                    .collect();
+                assert_eq!(
+                    providers,
+                    ["aihubmix", inferred_provider, "private-gateway"],
+                    "model={model}, reset={reset}"
+                );
+                if inferred_provider == "meta" {
+                    assert_meta_pricing(&messages[1], &competing_pricing(model));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn reset_metadata_does_not_revive_an_older_model_paired_provider() {
+    for reset_provider in nonauthoritative_provider_values() {
+        let model = "muse-spark-1.2";
+        let messages = parse(&[
+            metadata("aihubmix", Some(model)),
+            completion(39, model),
+            provider_reset_metadata(reset_provider, Some("local-custom-model")),
+            completion(40, "local-custom-model"),
+            completion(41, model),
+            metadata("private-gateway", Some("local-custom-model")),
+            completion(42, model),
+            completion(43, "local-custom-model"),
+        ]);
+        let providers: Vec<&str> = messages
+            .iter()
+            .map(|message| message.provider_id.as_str())
+            .collect();
+        assert_eq!(
+            providers,
+            ["aihubmix", "unknown", "meta", "meta", "private-gateway"]
+        );
+    }
+}
+
+#[test]
+fn initial_delayed_nonauthoritative_metadata_blocks_later_provider_backfill() {
+    for (model, inferred_provider) in [
+        ("muse-spark-1.2", "meta"),
+        ("local-custom-model", "unknown"),
+    ] {
+        for reset_provider in nonauthoritative_provider_values() {
+            let reset = provider_reset_metadata(reset_provider, Some(model));
+            let messages = parse(&[
+                completion(39, model),
+                reset.clone(),
+                completion(40, model),
+                metadata("aihubmix", Some(model)),
+                completion(41, model),
+            ]);
+            let providers: Vec<&str> = messages
+                .iter()
+                .map(|message| message.provider_id.as_str())
+                .collect();
+            assert_eq!(
+                providers,
+                [inferred_provider, inferred_provider, "aihubmix"],
+                "model={model}, reset={reset}"
+            );
+        }
+    }
+}
+
 #[test]
 fn provider_only_metadata_keeps_explicit_unknown_model_attribution() {
     let messages = parse(&[
