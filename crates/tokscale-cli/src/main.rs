@@ -5792,7 +5792,9 @@ fn run_import_command(
                 .yellow()
             );
         }
-        if graph.contributions.is_empty() {
+        // Either step can leave a day with no rows, which must not be sent.
+        prune_empty_days(&mut graph);
+        if graph.summary.total_tokens == 0 {
             eprintln!("{}", "\n  Nothing left to submit.\n".yellow());
             return Ok(());
         }
@@ -5888,11 +5890,13 @@ fn submit_imported_graph(payload: &TsTokenContributionData) -> Result<()> {
 fn drop_locally_scanned_usage(
     graph: &mut tokscale_core::GraphResult,
 ) -> Result<Vec<(String, String)>> {
-    use tokscale_core::{generate_submission_graph, GroupBy, ReportOptions};
+    use tokscale_core::{generate_local_graph_report, GroupBy, ReportOptions};
 
+    // Lenient pricing: this scan only needs which days have usage, and a
+    // pricing outage must not block a backfill that carries its own costs.
     let rt = tokio::runtime::Runtime::new()?;
     let local = rt
-        .block_on(generate_submission_graph(ReportOptions {
+        .block_on(generate_local_graph_report(ReportOptions {
             home_dir: None,
             use_env_roots: true,
             clients: Some(graph.summary.clients.clone()),
@@ -5948,18 +5952,20 @@ fn drop_overlapping_rows(
         }
     }
 
-    if !dropped.is_empty() {
-        graph.contributions.retain(|day| !day.clients.is_empty());
-        tokscale_core::calculate_intensities(&mut graph.contributions);
-        graph.summary = tokscale_core::calculate_summary(&graph.contributions);
-        graph.years = tokscale_core::calculate_years(&graph.contributions);
-        if let (Some(first), Some(last)) = (graph.contributions.first(), graph.contributions.last())
-        {
-            graph.meta.date_range_start = first.date.clone();
-            graph.meta.date_range_end = last.date.clone();
-        }
-    }
     dropped
+}
+
+/// Drop days left with no client rows and recompute everything derived from
+/// the days, after rows were taken out of an imported graph.
+fn prune_empty_days(graph: &mut tokscale_core::GraphResult) {
+    graph.contributions.retain(|day| !day.clients.is_empty());
+    tokscale_core::calculate_intensities(&mut graph.contributions);
+    graph.summary = tokscale_core::calculate_summary(&graph.contributions);
+    graph.years = tokscale_core::calculate_years(&graph.contributions);
+    if let (Some(first), Some(last)) = (graph.contributions.first(), graph.contributions.last()) {
+        graph.meta.date_range_start = first.date.clone();
+        graph.meta.date_range_end = last.date.clone();
+    }
 }
 
 /// The submit payload for an imported graph. MCP names stay the local ones, as
@@ -9174,6 +9180,30 @@ mod tests {
     }
 
     #[test]
+    fn import_submit_sends_nothing_when_only_cost_only_rows_remain() {
+        // A day whose only row is a cost with no tokens: the exclusion empties
+        // the day, and the empty day must not survive to be posted.
+        let mut graph = graph_result_with_contributions(vec![daily_contribution(
+            "2026-05-01",
+            0,
+            3.0,
+            "claude",
+            "claude-opus-4-8",
+        )]);
+        let excluded = exclude_tokenless_cost_contributions(&mut graph);
+        assert_eq!(excluded.len(), 1);
+        assert_eq!(
+            graph.contributions.len(),
+            1,
+            "the exclusion alone keeps the empty day"
+        );
+
+        prune_empty_days(&mut graph);
+        assert!(graph.contributions.is_empty());
+        assert_eq!(graph.summary.total_tokens, 0);
+    }
+
+    #[test]
     fn import_submit_drops_rows_this_machine_already_scanned() {
         let mut both = daily_contribution("2026-05-01", 100, 1.0, "claude", "claude-opus-4-8");
         let codex = daily_contribution("2026-05-01", 40, 0.5, "codex", "gpt-5.5");
@@ -9197,6 +9227,7 @@ mod tests {
         )]);
 
         let dropped = drop_overlapping_rows(&mut imported, &local);
+        prune_empty_days(&mut imported);
         assert_eq!(
             dropped,
             vec![("2026-05-01".to_string(), "claude".to_string())]
@@ -9216,6 +9247,7 @@ mod tests {
             daily_contribution("2026-05-02", 70, 0.7, "claude", "claude-opus-4-8"),
         ]);
         drop_overlapping_rows(&mut only_claude, &local);
+        prune_empty_days(&mut only_claude);
         assert_eq!(only_claude.contributions.len(), 1);
         assert_eq!(only_claude.meta.date_range_start, "2026-05-02");
         assert_eq!(only_claude.summary.total_tokens, 70);
