@@ -5800,8 +5800,10 @@ fn run_import_command(
             );
         }
         // Either step can leave a day with no rows, which must not be sent.
+        // Test rows rather than tokens: legacy Cursor charges are kept on
+        // purpose with zero tokens, and the server accepts them.
         prune_empty_days(&mut graph);
-        if graph.summary.total_tokens == 0 {
+        if graph.contributions.is_empty() {
             eprintln!("{}", "\n  Nothing left to submit.\n".yellow());
             return Ok(());
         }
@@ -5897,13 +5899,14 @@ fn submit_imported_graph(payload: &TsTokenContributionData) -> Result<()> {
 fn drop_locally_scanned_usage(
     graph: &mut tokscale_core::GraphResult,
 ) -> Result<Vec<(String, String)>> {
-    use tokscale_core::{generate_local_graph_report, GroupBy, ReportOptions};
+    use tokscale_core::{generate_source_graph_report, GroupBy, ReportOptions};
 
-    // Lenient pricing: this scan only needs which days have usage, and a
-    // pricing outage must not block a backfill that carries its own costs.
+    // This scan only needs which days `submit` would report: lenient pricing,
+    // so a pricing outage can't block a backfill that carries its own costs,
+    // and no local recovery overlay, which `submit` never sends.
     let rt = tokio::runtime::Runtime::new()?;
     let local = rt
-        .block_on(generate_local_graph_report(ReportOptions {
+        .block_on(generate_source_graph_report(ReportOptions {
             home_dir: None,
             use_env_roots: true,
             clients: Some(graph.summary.clients.clone()),
@@ -9208,6 +9211,20 @@ mod tests {
         prune_empty_days(&mut graph);
         assert!(graph.contributions.is_empty());
         assert_eq!(graph.summary.total_tokens, 0);
+
+        // A legacy Cursor charge is kept on purpose with zero tokens; its day
+        // must survive so the submission still goes out.
+        let mut cursor = graph_result_with_contributions(vec![daily_contribution(
+            "2026-05-01",
+            0,
+            3.0,
+            "cursor",
+            "premium-tool-call",
+        )]);
+        assert!(exclude_tokenless_cost_contributions(&mut cursor).is_empty());
+        prune_empty_days(&mut cursor);
+        assert_eq!(cursor.contributions.len(), 1);
+        assert_eq!(cursor.summary.total_tokens, 0);
     }
 
     #[test]
