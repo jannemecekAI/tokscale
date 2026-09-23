@@ -4,8 +4,8 @@
 //! `ccusage`'s own `daily --json` output (the `cc.json` that viberank and
 //! similar dashboards ingest). The importer normalizes either into tokscale's
 //! native [`GraphResult`], which the CLI then writes out as standard tokscale
-//! JSON (identical in shape to `tokscale graph`) for review, archival, or a
-//! future server-supported backfill.
+//! JSON (identical in shape to `tokscale graph`) for review or archival, or
+//! uploads it as labelled backfill with `import --submit`.
 //!
 //! Motivation: `tokscale submit` computes totals from *raw* local session
 //! files. Once those files are gone (Claude Code deletes transcripts after
@@ -33,12 +33,11 @@
 //! [`ccusage_token_breakdown`] for why that matters when mapping into
 //! tokscale's additive buckets.
 //!
-//! IMPORTANT — upload boundary: importing only *normalizes* data to a file. It
-//! does not submit anything to the leaderboard. Backfilled aggregates are not
-//! independently verifiable the way locally-scanned sessions are, so uploading
-//! them requires server-side support for tagging backfilled submissions
-//! distinctly from live CLI usage (so the two are not ranked identically).
-//! See <https://github.com/junhoyeo/tokscale/issues/888>.
+//! IMPORTANT — upload boundary: this module only *normalizes* data. Uploading
+//! is the caller's `import --submit`, which tags the submission
+//! `origin: "backfill"`: backfilled aggregates are not independently verifiable
+//! the way locally-scanned sessions are, so the server keeps them distinct from
+//! live CLI usage. See <https://github.com/junhoyeo/tokscale/issues/888>.
 
 use anyhow::{bail, Context, Result};
 use chrono::NaiveDate;
@@ -64,7 +63,7 @@ pub struct ImportOutcome {
     /// Number of per-model rows with `cost > 0` but every token field `0`.
     /// The server rejects submissions shaped like this ("Cost submitted
     /// without tokens"), so these are surfaced as a warning rather than
-    /// silently dropped — this importer does not upload, so the row is kept
+    /// silently dropped — this module does not upload, so the row is kept
     /// as-is for the caller to inspect. Cursor's legacy `premium-tool-call`
     /// rows are exempt (see [`is_cursor_legacy_tokenless`]), matching the
     /// server's own carve-out.

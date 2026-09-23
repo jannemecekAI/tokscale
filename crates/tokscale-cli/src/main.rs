@@ -260,6 +260,17 @@ enum Commands {
         output: Option<String>,
         #[arg(long, help = "Parse and summarize only; do not emit normalized JSON")]
         dry_run: bool,
+        #[arg(
+            long,
+            help = "Upload the imported history to the leaderboard, labelled as backfill (requires login)"
+        )]
+        submit: bool,
+        #[arg(
+            long,
+            requires = "submit",
+            help = "Label naming where the imported data came from (default: the --format value)"
+        )]
+        importer: Option<String>,
     },
     #[command(about = "Launch interactive TUI with optional filters")]
     Tui {
@@ -824,9 +835,11 @@ fn main() -> Result<()> {
             format,
             output,
             dry_run,
+            submit,
+            importer,
         }) => {
             reject_unsupported_home_override(&cli.home, "import")?;
-            run_import_command(file, format, output, dry_run)
+            run_import_command(file, format, output, dry_run, submit, importer)
         }
         Some(Commands::Tui { clients, date }) => {
             ensure_home_supported_for_tui(&cli.home)?;
@@ -4862,6 +4875,17 @@ struct TsScanScope {
     full_history: bool,
 }
 
+/// Submission-level provenance (#888): history recovered from an aggregate
+/// export rather than scanned from local session files. The server stamps it
+/// on every client row it writes and flags the profile as including imported
+/// history.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TsSubmissionProvenance {
+    origin: &'static str,
+    importer: String,
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsTokenContributionData {
@@ -4877,6 +4901,8 @@ struct TsTokenContributionData {
     time_metrics: Option<TsTimeMetrics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mcp_servers: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<TsSubmissionProvenance>,
 }
 
 fn to_ts_token_contribution_data(
@@ -4982,6 +5008,7 @@ fn to_ts_token_contribution_data(
                 Some(servers)
             }
         },
+        provenance: None,
     }
 }
 
@@ -5551,6 +5578,8 @@ fn run_import_command(
     format: String,
     output: Option<String>,
     dry_run: bool,
+    submit: bool,
+    importer: Option<String>,
 ) -> Result<()> {
     use colored::Colorize;
 
@@ -5714,6 +5743,85 @@ fn run_import_command(
         eprintln!("{}", format!("\n  Warning: {}", warning).yellow());
     }
 
+    if submit {
+        let importer = importer.unwrap_or_else(|| fmt.clone()).trim().to_string();
+        if importer.is_empty() || importer.chars().count() > 64 {
+            return Err(anyhow::anyhow!("--importer must be 1-64 characters"));
+        }
+        // The server rejects a whole submission over one unknown client or one
+        // future-dated day, so stop here rather than after an upload that
+        // cannot succeed.
+        if !outcome.unknown_clients.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Not submitting: the leaderboard would reject unrecognized client id(s): {}",
+                outcome.unknown_clients.join(", ")
+            ));
+        }
+        if outcome.future_dated_rows > 0 {
+            return Err(anyhow::anyhow!(
+                "Not submitting: {} row(s) are dated in the future, which the leaderboard rejects",
+                outcome.future_dated_rows
+            ));
+        }
+
+        let mut graph = outcome.graph.clone();
+        let excluded_rows = exclude_tokenless_cost_contributions(&mut graph);
+        report_excluded_tokenless_rows(&excluded_rows);
+        let overlap = drop_locally_scanned_usage(&mut graph)?;
+        if !overlap.is_empty() {
+            const MAX_LISTED: usize = 10;
+            let listed: Vec<String> = overlap
+                .iter()
+                .take(MAX_LISTED)
+                .map(|(date, client)| format!("{date} {client}"))
+                .collect();
+            let more = overlap.len().saturating_sub(MAX_LISTED);
+            eprintln!(
+                "{}",
+                format!(
+                    "\n  Left out {} day/client row(s) this machine's own scan already covers \
+                     (`tokscale submit` reports those), so they are not counted twice: {}{}",
+                    overlap.len(),
+                    listed.join(", "),
+                    if more > 0 {
+                        format!(" and {more} more")
+                    } else {
+                        String::new()
+                    }
+                )
+                .yellow()
+            );
+        }
+        if graph.contributions.is_empty() {
+            eprintln!("{}", "\n  Nothing left to submit.\n".yellow());
+            return Ok(());
+        }
+        eprintln!(
+            "{}",
+            format!(
+                "\n  To submit as imported history ({}): {} days, {} tokens, {}",
+                importer,
+                graph.summary.active_days,
+                format_tokens_with_commas(graph.summary.total_tokens),
+                format_currency(graph.summary.total_cost)
+            )
+            .white()
+        );
+        let payload = backfill_payload(&graph, &importer);
+        if let Some(output_path) = output {
+            std::fs::write(&output_path, serde_json::to_string_pretty(&payload)?)?;
+            eprintln!(
+                "{}",
+                format!("\n  ✓ Payload written to {}", output_path).green()
+            );
+        }
+        if dry_run {
+            eprintln!("{}", "\n  Dry run - not submitting.\n".yellow());
+            return Ok(());
+        }
+        return submit_imported_graph(&payload);
+    }
+
     if dry_run {
         eprintln!(
             "{}",
@@ -5746,13 +5854,124 @@ fn run_import_command(
     eprintln!(
         "{}",
         "\n  Note: import only converts data to tokscale's format; it does not \
-         upload to the leaderboard.\n  Uploading backfilled history needs \
-         server-side support for tagging it distinctly from live CLI usage \
+         upload to the leaderboard.\n  Pass --submit to upload it as imported \
+         history, tagged apart from live CLI usage \
          (see https://github.com/junhoyeo/tokscale/issues/888).\n"
             .bright_black()
     );
 
     Ok(())
+}
+
+/// `import --submit`: upload an imported graph tagged `origin: "backfill"` so
+/// the server can tell it from a local scan (#888). It carries no device, so
+/// it lands on the legacy device row rather than being merged into, or frozen
+/// by, this machine's scanned device; that is why the caller first drops what
+/// this machine's scan covers. No scan scope, so it never establishes or
+/// advances a parser high-water.
+fn submit_imported_graph(payload: &TsTokenContributionData) -> Result<()> {
+    use colored::Colorize;
+
+    let auth_token = auth::resolve_api_token().ok_or_else(|| {
+        anyhow::anyhow!("Not logged in. Run `tokscale login` or set TOKSCALE_API_TOKEN.")
+    })?;
+    eprintln!("{}", "\n  Submitting as imported history...".bright_black());
+    let rt = tokio::runtime::Runtime::new()?;
+    post_submission(&rt, &auth_token, payload, SubmitMode::Interactive)
+}
+
+/// Drop the (date, client) rows of an imported graph that this machine's own
+/// scan also reports, and return them. A device-less backfill is summed with
+/// the scanned device, so an export of history that is still on disk (the
+/// usual `ccusage` case) would otherwise be counted twice. History submitted
+/// earlier whose files are gone can't be seen from here.
+fn drop_locally_scanned_usage(
+    graph: &mut tokscale_core::GraphResult,
+) -> Result<Vec<(String, String)>> {
+    use tokscale_core::{generate_submission_graph, GroupBy, ReportOptions};
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let local = rt
+        .block_on(generate_submission_graph(ReportOptions {
+            home_dir: None,
+            use_env_roots: true,
+            clients: Some(graph.summary.clients.clone()),
+            since: Some(graph.meta.date_range_start.clone()),
+            until: Some(graph.meta.date_range_end.clone()),
+            year: None,
+            group_by: GroupBy::default(),
+            worktree_rollup: tokscale_core::WorktreeRollup::default(),
+            scanner_settings: tui::settings::load_scanner_settings(),
+        }))
+        .map_err(|e| anyhow::anyhow!(e))?;
+    Ok(drop_overlapping_rows(graph, &local))
+}
+
+fn drop_overlapping_rows(
+    graph: &mut tokscale_core::GraphResult,
+    local: &tokscale_core::GraphResult,
+) -> Vec<(String, String)> {
+    let scanned: std::collections::HashSet<(&str, &str)> = local
+        .contributions
+        .iter()
+        .flat_map(|day| {
+            day.clients
+                .iter()
+                .filter(|c| c.tokens.total() > 0)
+                .map(move |c| (day.date.as_str(), c.client.as_str()))
+        })
+        .collect();
+
+    let mut dropped: Vec<(String, String)> = Vec::new();
+    for day in graph.contributions.iter_mut() {
+        let before = day.clients.len();
+        day.clients.retain(|c| {
+            let overlaps = scanned.contains(&(day.date.as_str(), c.client.as_str()));
+            if overlaps
+                && !dropped
+                    .iter()
+                    .any(|(d, cl)| d == &day.date && cl == &c.client)
+            {
+                dropped.push((day.date.clone(), c.client.clone()));
+            }
+            !overlaps
+        });
+        if day.clients.len() != before {
+            let mut breakdown = tokscale_core::TokenBreakdown::default();
+            for client in &day.clients {
+                breakdown += &client.tokens;
+            }
+            day.totals.tokens = breakdown.total();
+            day.totals.cost = day.clients.iter().map(|c| c.cost).sum();
+            day.totals.messages = day.clients.iter().map(|c| c.messages).sum();
+            day.token_breakdown = breakdown;
+        }
+    }
+
+    if !dropped.is_empty() {
+        graph.contributions.retain(|day| !day.clients.is_empty());
+        tokscale_core::calculate_intensities(&mut graph.contributions);
+        graph.summary = tokscale_core::calculate_summary(&graph.contributions);
+        graph.years = tokscale_core::calculate_years(&graph.contributions);
+        if let (Some(first), Some(last)) = (graph.contributions.first(), graph.contributions.last())
+        {
+            graph.meta.date_range_start = first.date.clone();
+            graph.meta.date_range_end = last.date.clone();
+        }
+    }
+    dropped
+}
+
+/// The submit payload for an imported graph. MCP names stay the local ones, as
+/// `submit` sends them: the server stores the latest list per profile, and an
+/// empty one would clear it.
+fn backfill_payload(graph: &tokscale_core::GraphResult, importer: &str) -> TsTokenContributionData {
+    let mut payload = to_ts_token_contribution_data(graph, None, None);
+    payload.provenance = Some(TsSubmissionProvenance {
+        origin: "backfill",
+        importer: importer.to_string(),
+    });
+    payload
 }
 
 #[derive(serde::Deserialize)]
@@ -6301,18 +6520,39 @@ fn run_submit_command(
 
     println!("{}", "  Submitting to server...".bright_black());
 
-    let api_url = auth::get_api_base_url();
-
     let submit_device = device::resolve_submit_device()?;
     let submit_payload =
         to_ts_token_contribution_data(&graph_result, Some(&submit_device), scan_scope);
+    post_submission(&rt, &auth_token, &submit_payload, mode)?;
+
+    // Warm the TUI cache so the next `tokscale` launch is instant.
+    // Detached subprocess so submit returns to the shell immediately on large
+    // datasets — a full re-scan would otherwise block for tens of seconds.
+    if mode == SubmitMode::Interactive {
+        spawn_warm_tui_cache_detached();
+    }
+
+    Ok(())
+}
+
+/// POST a prepared payload to `/api/submit` and report the outcome. Shared by
+/// `submit` (a local scan) and `import --submit` (an aggregate export).
+fn post_submission(
+    rt: &tokio::runtime::Runtime,
+    auth_token: &auth::ApiTokenAuth,
+    submit_payload: &TsTokenContributionData,
+    mode: SubmitMode,
+) -> Result<()> {
+    use colored::Colorize;
+
+    let api_url = auth::get_api_base_url();
 
     let response = rt.block_on(async {
         tokscale_core::http::client()
             .post(format!("{}/api/submit", api_url))
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Bearer {}", auth_token.token))
-            .json(&submit_payload)
+            .json(submit_payload)
             .send()
             .await
     });
@@ -6423,13 +6663,6 @@ fn run_submit_command(
             }
             std::process::exit(1);
         }
-    }
-
-    // Warm the TUI cache so the next `tokscale` launch is instant.
-    // Detached subprocess so submit returns to the shell immediately on large
-    // datasets — a full re-scan would otherwise block for tens of seconds.
-    if mode == SubmitMode::Interactive {
-        spawn_warm_tui_cache_detached();
     }
 
     Ok(())
@@ -8905,6 +9138,87 @@ mod tests {
         assert!(json
             .pointer("/contributions/1/totals/costIsComplete")
             .is_none());
+    }
+
+    #[test]
+    fn imported_graph_submits_as_backfill_without_device_or_scope() {
+        let graph = graph_result_with_contributions(vec![daily_contribution(
+            "2026-05-01",
+            1_000,
+            1.25,
+            "claude",
+            "claude-opus-4-8",
+        )]);
+
+        let json = serde_json::to_value(backfill_payload(&graph, "ccusage")).unwrap();
+        assert_eq!(
+            json.get("provenance"),
+            Some(&serde_json::json!({ "origin": "backfill", "importer": "ccusage" }))
+        );
+        // No device: the server files it on the legacy row, where `origin` in
+        // the ratchet key keeps it additive with scanned history.
+        assert!(json.get("device").is_none());
+        // No scan scope: a backfill never sets or advances a parser high-water.
+        assert!(json.get("scanScope").is_none());
+        assert_eq!(
+            json.pointer("/contributions/0/date"),
+            Some(&serde_json::json!("2026-05-01"))
+        );
+
+        // An ordinary scan payload stays unlabelled, and both carry the same
+        // (local) MCP list, so a backfill doesn't clear the profile's.
+        let scanned =
+            serde_json::to_value(to_ts_token_contribution_data(&graph, None, None)).unwrap();
+        assert!(scanned.get("provenance").is_none());
+        assert_eq!(json.get("mcpServers"), scanned.get("mcpServers"));
+    }
+
+    #[test]
+    fn import_submit_drops_rows_this_machine_already_scanned() {
+        let mut both = daily_contribution("2026-05-01", 100, 1.0, "claude", "claude-opus-4-8");
+        let codex = daily_contribution("2026-05-01", 40, 0.5, "codex", "gpt-5.5");
+        both.clients.extend(codex.clients);
+        both.totals.tokens = 140;
+        both.totals.cost = 1.5;
+        both.totals.messages = 2;
+        both.token_breakdown = token_breakdown(140);
+        let mut imported = graph_result_with_contributions(vec![
+            both,
+            daily_contribution("2026-05-02", 70, 0.7, "claude", "claude-opus-4-8"),
+        ]);
+        // This machine's scan still has Claude on 05-01 (a different model even),
+        // and nothing on 05-02.
+        let local = graph_result_with_contributions(vec![daily_contribution(
+            "2026-05-01",
+            90,
+            0.9,
+            "claude",
+            "claude-fable-5",
+        )]);
+
+        let dropped = drop_overlapping_rows(&mut imported, &local);
+        assert_eq!(
+            dropped,
+            vec![("2026-05-01".to_string(), "claude".to_string())]
+        );
+        let may = &imported.contributions[0];
+        assert_eq!(may.clients.len(), 1);
+        assert_eq!(may.clients[0].client, "codex");
+        assert_eq!(may.totals.tokens, 40);
+        assert_eq!(may.token_breakdown.total(), 40);
+        assert!((may.totals.cost - 0.5).abs() < 1e-9);
+        assert_eq!(imported.summary.total_tokens, 110);
+        assert_eq!(imported.contributions[1].totals.tokens, 70);
+
+        // A day left with no clients disappears, and the range follows.
+        let mut only_claude = graph_result_with_contributions(vec![
+            daily_contribution("2026-05-01", 100, 1.0, "claude", "claude-opus-4-8"),
+            daily_contribution("2026-05-02", 70, 0.7, "claude", "claude-opus-4-8"),
+        ]);
+        drop_overlapping_rows(&mut only_claude, &local);
+        assert_eq!(only_claude.contributions.len(), 1);
+        assert_eq!(only_claude.meta.date_range_start, "2026-05-02");
+        assert_eq!(only_claude.summary.total_tokens, 70);
     }
 
     #[test]
